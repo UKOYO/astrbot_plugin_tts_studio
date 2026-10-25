@@ -20,7 +20,11 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-import emoji as emoji_lib
+try:  # 可选依赖：装了就用官方 emoji 表精确判定，没装也能正常出图
+    import emoji as emoji_lib
+except ModuleNotFoundError:  # 插件首次加载时依赖可能尚未安装
+    emoji_lib = None
+
 from PIL import Image, ImageDraw, ImageFont
 
 # 配色常量
@@ -42,6 +46,28 @@ F_SECTION = 20
 F_BODY = 18
 F_SMALL = 15
 F_TINY = 13
+
+# emoji 库缺失时的兜底判定区段：只覆盖真正的表情/符号平面，
+# 不碰 ▸ ▲ ● 这类排版字形，保证两种路径下卡片观感一致。
+_EMOJI_FALLBACK_RANGES = (
+    (0x2600, 0x27BF),   # 杂项符号 + 装饰符号（☀ ✨ ✔ 等）
+    (0x2B00, 0x2BFF),   # 杂项符号与箭头（⭐ ⭕ 等）
+    (0x1F000, 0x1FAFF), # 表情、象形符号、交通/补充符号
+    (0xFE0F, 0xFE0F),   # 变体选择符 VS16
+    (0x200D, 0x200D),   # 零宽连接符 ZWJ
+)
+
+
+def _is_emoji(char: str) -> bool:
+    """单个字符是否该走 emoji 字体。
+
+    优先用 emoji 库的权威字表；库未安装时退回 Unicode 区段判断，
+    这样插件在依赖缺失的情况下依然能加载并正常渲染卡片。
+    """
+    if emoji_lib is not None:
+        return char in emoji_lib.EMOJI_DATA
+    code = ord(char)
+    return any(low <= code <= high for low, high in _EMOJI_FALLBACK_RANGES)
 
 
 @dataclass(slots=True)
@@ -95,7 +121,7 @@ class HelpCardMaker:
         emoji_font = self._emoji_font(size)
         total = 0
         for char in text:
-            if char in emoji_lib.EMOJI_DATA:
+            if _is_emoji(char):
                 total += int(emoji_font.getlength(char))
             else:
                 total += int(font.getlength(char))
@@ -113,7 +139,7 @@ class HelpCardMaker:
         font = self._font(size)
         emoji_font = self._emoji_font(size)
         for char in text:
-            if char in emoji_lib.EMOJI_DATA:
+            if _is_emoji(char):
                 draw.text((x, y + size // 4), char, font=emoji_font, fill=fill)
                 x += int(emoji_font.getlength(char))
             else:
