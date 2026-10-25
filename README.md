@@ -159,6 +159,9 @@ AstrBot 的指令受唤醒前缀约束，本机当前前缀是 `大魔王` / `�
 
 依赖：AstrBot `>= 4.22.0`，用到 `on_decorating_result`、`context.send_message`、provider 的 `text_chat` 与 `get_audio`。
 
+Python 依赖：`emoji`、`Pillow`，已在仓库根的 `requirements.txt` 中声明，AstrBot 加载插件时会自动安装缺失项。
+`emoji` 属于可选增强——即使暂时没装上，插件仍能正常加载，帮助卡片里表情改走主字体渲染。
+
 ## 三、指令
 
 指令关键字之间可带空格，也可以连写；音色名称或供应商 ID 内部的空格会保留。
