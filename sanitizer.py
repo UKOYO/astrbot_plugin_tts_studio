@@ -55,10 +55,39 @@ EMOJI = re.compile(
 WHITESPACE = re.compile(r"[ \t\u3000]+")
 NEWLINES = re.compile(r"\n{2,}")
 
+# 中日文之间的空格：声码器读不出停顿，转成逗号才断得开
+CJK_CHAR = "\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff"
+CJK_SPACE = re.compile(rf"(?<=[{CJK_CHAR}])[ \t]+(?=[{CJK_CHAR}])")
+
 # 朗读前的标点收尾：声码器怕连续符号
 DUP_PUNCT = re.compile(r"([，。！？、；：,.!?;:])\1+")
 LEADING_PUNCT = re.compile(r"^[\s，。！？、；：,.!?;:…~—]+")
 TRAILING_SPACE_BEFORE_PUNCT = re.compile(r"\s+([，。！？、；：,.!?;:])")
+
+END_PUNCTS = frozenset("，。！？、；：…~—,.!?;:!?")
+
+
+def convert_newlines_to_stops(text: str) -> str:
+    """把换行转换为停顿标点。行尾若无终止标点则补句号，已有标点则保留微气口。"""
+    if not text:
+        return ""
+    lines = text.split("\n")
+    result: list[str] = []
+    for line in lines:
+        line_s = line.strip()
+        if not line_s:
+            continue
+        if line_s[-1] not in END_PUNCTS:
+            result.append(line_s + "。")
+        else:
+            result.append(line_s)
+    return " ".join(result)
+
+
+
+def space_to_comma(text: str) -> str:
+    """中日文之间的空格改成逗号，让声码器读出停顿；英文单词间的空格保留。"""
+    return CJK_SPACE.sub("，", text or "")
 
 
 def strip_brace_blocks(text: str) -> str:
@@ -126,8 +155,10 @@ def strip_for_speech(
         out = strip_stage_directions(out)
     out = strip_markup(out) if strip_emoji else _strip_markdown_only(out)
     out = WHITESPACE.sub(" ", out)
-    out = out if keep_newlines else out.replace("\n", " ")
     out = NEWLINES.sub("\n", out)
+    if not keep_newlines:
+        out = convert_newlines_to_stops(out)
+    out = space_to_comma(out)
     out = tidy_punctuation(out).strip()
     if max_chars and len(out) > max_chars:
         out = out[:max_chars].rstrip() + "……"

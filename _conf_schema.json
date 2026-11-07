@@ -45,6 +45,12 @@
     "default": "",
     "hint": "填用户 ID，多个用逗号分隔，通常只填一个。留空则主人相关逻辑不启用。"
   },
+  "restricted_voices": {
+    "type": "string",
+    "description": "限定音色列表",
+    "default": "大魔王",
+    "hint": "填音色名称或供应商ID，多个用逗号分隔。这些音色仅允许主用户（白名单）通过指令切换，非白名单切换将提示权限不足。"
+  },
   "voice_language": {
     "type": "string",
     "description": "语音语种",
@@ -82,7 +88,7 @@
       "美国俚语黑人西海岸口音",
       "东北话"
     ],
-    "default": "ja"
+    "default": "zh"
   },
   "conversion_provider_id": {
     "type": "string",

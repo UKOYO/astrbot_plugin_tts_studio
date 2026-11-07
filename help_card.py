@@ -7,13 +7,17 @@
       * #FFFFFF (White / 纯白): 区域底色、辅助框、标签底
       * #FFF9F2 (Ivory / 象牙白): 画布与卡片主背景
       * #D45060 (Coral Rose / 珊瑚绯红): 状态标签、强调点缀、高亮标记
-  - 字体：OPPO Sans 4.0 (OPPOSans-4.0.ttf) + NotoColorEmoji.ttf
+  - 字体：优先 resources/ 内置字体，缺失则回退系统字体
+      * Windows: msyh.ttc → Deng.ttf → simhei.ttf → simsun.ttc
+      * Linux: NotoSansCJK → wqy-microhei / macOS: PingFang
   - 结构：非对称瑞士网格，左侧音色列表，右侧语种列表，底部切换说明。
 """
 
 from __future__ import annotations
 
 import io
+import logging
+import os
 from dataclasses import dataclass, field
 from datetime import date
 from io import BytesIO
@@ -22,6 +26,8 @@ from typing import Any
 
 import emoji as emoji_lib
 from PIL import Image, ImageDraw, ImageFont
+
+logger = logging.getLogger(__name__)
 
 # 配色常量
 COLOR_PRIMARY = (128, 0, 32)       # #800020 勃艮第酒红
@@ -44,11 +50,24 @@ F_SMALL = 15
 F_TINY = 13
 
 
+def _first_existing(*candidates: Path) -> Path:
+    """按顺序返回第一个存在的字体路径；全都不存在就返回第一个候选路径（后续加载会报错）。"""
+    for p in candidates:
+        try:
+            if p.is_file():
+                return p
+        except OSError:
+            continue
+    return candidates[0]
+
+
+_WIN_FONTS = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+_HERE = Path(__file__).resolve().parent
+
+
 @dataclass(slots=True)
 class HelpCardTheme:
-    resource_dir: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parent / "resources"
-    )
+    resource_dir: Path = field(default_factory=lambda: _HERE / "resources")
     font_name: str = "OPPOSans-4.0.ttf"
     emoji_font_name: str = "NotoColorEmoji.ttf"
 
@@ -58,11 +77,25 @@ class HelpCardTheme:
 
     @property
     def font_path(self) -> Path:
-        return self.resource_dir / self.font_name
+        return _first_existing(
+            self.resource_dir / self.font_name,
+            _WIN_FONTS / "msyh.ttc",
+            _WIN_FONTS / "Deng.ttf",
+            _WIN_FONTS / "simhei.ttf",
+            _WIN_FONTS / "simsun.ttc",
+            Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+            Path("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
+            Path("/System/Library/Fonts/PingFang.ttc"),
+        )
 
     @property
     def emoji_font_path(self) -> Path:
-        return self.resource_dir / self.emoji_font_name
+        return _first_existing(
+            self.resource_dir / self.emoji_font_name,
+            _WIN_FONTS / "seguiemj.ttf",
+            Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
+            Path("/System/Library/Fonts/Apple Color Emoji.ttc"),
+        )
 
 
 class HelpCardMaker:
@@ -77,7 +110,12 @@ class HelpCardMaker:
         if key not in self._fonts:
             try:
                 self._fonts[key] = ImageFont.truetype(str(self.theme.font_path), size)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "help_card: 正文字体加载失败 (%s): %s，回退内置位图字体",
+                    self.theme.font_path,
+                    exc,
+                )
                 self._fonts[key] = ImageFont.load_default()
         return self._fonts[key]
 
@@ -86,7 +124,12 @@ class HelpCardMaker:
         if key not in self._fonts:
             try:
                 self._fonts[key] = ImageFont.truetype(str(self.theme.emoji_font_path), size)
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "help_card: emoji 字体加载失败 (%s): %s，回退正文字体",
+                    self.theme.emoji_font_path,
+                    exc,
+                )
                 self._fonts[key] = self._font(size)
         return self._fonts[key]
 
@@ -272,8 +315,15 @@ class HelpCardMaker:
         vy = col_top_y + 48
         for v in voices:
             tag = v.get("tag", "可用")
-            tag_bg = COLOR_ACCENT if tag in ("默认", "当前") else COLOR_SECONDARY
-            tag_text_color = (255, 255, 255) if tag in ("默认", "当前") else TEXT_MAIN
+            if tag in ("默认", "当前"):
+                tag_bg = COLOR_ACCENT
+                tag_text_color = (255, 255, 255)
+            elif tag == "限定":
+                tag_bg = COLOR_PRIMARY
+                tag_text_color = (255, 255, 255)
+            else:
+                tag_bg = COLOR_SECONDARY
+                tag_text_color = TEXT_MAIN
             
             draw.rectangle([col_left_x + 14, vy + 4, col_left_x + 60, vy + 24], fill=tag_bg + (255,))
             self._draw_text(draw, (col_left_x + 20, vy + 5), tag, F_TINY, tag_text_color)
@@ -328,9 +378,9 @@ class HelpCardMaker:
         self._draw_text(draw, (cx + 120, y + 12), "常用切换指令速查（仅在当前私聊／群会话生效）", F_TINY, TEXT_MUTED)
 
         tips = [
-            "▸ 切换音色：发送「tts 音色 大魔王」/「tts 音色 晓美焰」/「tts 音色 默认」（恢复全局）",
-            "▸ 切换语种：发送「tts 语种 日语」/「tts 语种 关西腔」/「tts 语种 默认」（恢复全局）",
-            "▸ 开关控制：发送「tts 开启」或「tts 关闭」控制语音生成",
+            "◆ 切换音色：发送「tts 音色 大魔王」/「tts 音色 晓美焰」/「tts 音色 默认」（恢复全局）",
+            "◆ 切换语种：发送「tts 语种 日语」/「tts 语种 关西腔」/「tts 语种 默认」（恢复全局）",
+            "◆ 开关控制：发送「tts 开启」或「tts 关闭」控制语音生成",
         ]
         ty = y + 38
         for tip in tips:
@@ -340,7 +390,8 @@ class HelpCardMaker:
         y += footer_tips_h + 16
 
         # ================= 5. 底部版权与规格 =================
-        footer_left = "ASTRBOT TTS STUDIO // SWISS GRID DESIGN // OPPO SANS 4.0"
+        font_tag = self.theme.font_path.stem.upper()
+        footer_left = f"ASTRBOT TTS STUDIO // SWISS GRID DESIGN // {font_tag}"
         self._draw_text(draw, (cx, y), footer_left, F_TINY, TEXT_MUTED)
 
         footer_right = "STATUS: ACTIVE // ISOLATED PER SESSION"

@@ -1,9 +1,7 @@
 __pycache__/
 *.pyc
+.venv/
+venv/
 *.bak
 *.bak-*
-*.bak2-*
-test_*.py
-
-resources/*.ttf
-resources/*.otf
+*.bak_*

@@ -36,6 +36,9 @@ from .sanitizer import strip_for_speech
 
 LOG_TAG = "[TTSStudio]"
 
+# 剥掉 {} 包住的演出描写，只留能念出来的口白
+_BRACE_RE = re.compile(r"\{[^{}]*\}")
+
 
 class CompactTTSCommandFilter(CustomFilter):
     """Accept compact commands without duplicating the standard command routes."""
@@ -317,6 +320,8 @@ CONVERSION_SYSTEM_TEMPLATE = """
 - 中文评价、语气词和说明句必须改成{language}，不要夹中文。
 - 保留原回复的情绪，并贴合当前人格的称呼、距离感、口癖和说话方式。
 - 不要添加原文没有的新信息。
+- 逐字等义锁（最高优先级）：原文有几个字，输出就几个字，差异只允许是标点与必要的文字书写替换；严禁增删字词、严禁补开场垫词、严禁加原文没有的收尾反问或语气词尾巴。
+- 输出前自检：把输出逐小句对回原文，凡是在原文里找不到对应内容的小句，直接删掉；凡是原文有而输出漏掉的意思，补回来。
 {extra}
 """.strip()
 
@@ -343,13 +348,15 @@ def _voice_preview_dir() -> Path:
     return _session_store_path().parent / "voice_previews"
 
 
+# Fish Audio S2 / Drama 3 走方括号标记，圆括号是 S1 的旧语法，S2 不认也不转换。
+# neutral 留空：中性段不挂标记，省得被当成正文念出来。
 EMOTION_TAGS: dict[str, str] = {
-    "neutral": "(neutral)",
-    "happy": "(happy)",
-    "sad": "(sad)",
-    "angry": "(angry)",
-    "whisper": "(whisper)",
-    "excited": "(excited)",
+    "neutral": "",
+    "happy": "[happy]",
+    "sad": "[sad]",
+    "angry": "[angry]",
+    "whisper": "[whispering]",
+    "excited": "[excited]",
 }
 
 @register(
@@ -463,7 +470,7 @@ class TtsStudio(Star):
                     "name": display_name,
                     "desc": description,
                     "cmd": f"tts 音色{command_name}",
-                    "tag": "默认" if provider_id == str(self._cfg("tts_provider_id", "") or "").strip() else "可用",
+                    "tag": "限定" if (self._is_voice_restricted(provider_id) or self._is_voice_restricted(display_name)) else ("默认" if provider_id == str(self._cfg("tts_provider_id", "") or "").strip() else "可用"),
                 })
             except Exception as exc:
                 logger.debug("%s 跳过无法读取的 TTS 供应商: %s", LOG_TAG, exc)
@@ -559,6 +566,10 @@ class TtsStudio(Star):
                     f"tts：没有「{voice}」这个音色，没换（现有音色发「tts 音色列表」看）"
                 )
                 return
+            if self._is_voice_restricted(resolved) or self._is_voice_restricted(voice):
+                if not self._can_use_restricted_voice(event):
+                    yield event.plain_result(f"tts：权限不足，「{voice}」为专属限定音色，仅限白名单开放")
+                    return
             self._set_session_voice(session, resolved)
             yield event.plain_result(f"tts：本会话改用音色{voice}了（只在这里生效）")
             await self._send_voice_preview(event)
@@ -615,7 +626,14 @@ class TtsStudio(Star):
     # ---------------------------------------------------------------- 配置
 
     def _cfg(self, key: str, default: Any = None) -> Any:
-        return self.config.get(key, default)
+        if key in self.config:
+            return self.config[key]
+        adv = self.config.get("advanced")
+        if isinstance(adv, dict):
+            for sub in adv.values():
+                if isinstance(sub, dict) and key in sub:
+                    return sub[key]
+        return default
 
     def _enabled(self) -> bool:
         return bool(self._cfg("enable", True))
@@ -756,6 +774,9 @@ class TtsStudio(Star):
         # voice
         if self._session_voice(session) == value:
             return None
+        if self._is_voice_restricted(value):
+            if not self._can_use_restricted_voice(event):
+                return f"tts：权限不足，「{value}」为专属限定音色，仅限白名单开放"
         self._set_session_voice(session, value)
         return f"tts：本会话音色换成 {value} 了"
 
@@ -828,11 +849,12 @@ class TtsStudio(Star):
         """这个会话该用哪种语种：单独设过就用设的，否则跟着面板的全局值。"""
         labels = self._language_labels()
         if session:
+            self._session_langs = self._load_session_langs()
             picked = self._session_langs.get(str(session))
             if picked in labels:
                 return picked
-        value = str(self._cfg("voice_language", "ja") or "ja").strip()
-        return value if value in labels else "ja"
+        value = str(self._cfg("voice_language", "zh") or "zh").strip()
+        return value if value in labels else "zh"
 
     def _session_language(self, session: str | None) -> str | None:
         """这个会话单独设过的语种；没设过返回 None。"""
@@ -1006,6 +1028,29 @@ class TtsStudio(Star):
         raw = self._cfg("primary_user_ids", "") or ""
         return {t.strip() for t in re.split(r"[\s,，;；\n]+", str(raw)) if t.strip()}
 
+    def _restricted_voices(self) -> set[str]:
+        raw = self._cfg("restricted_voices", "大魔王") or ""
+        return {t.strip().lower() for t in re.split(r"[\s,，;；\n]+", str(raw)) if t.strip()}
+
+    def _is_voice_restricted(self, voice_name_or_id: str) -> bool:
+        needle = (voice_name_or_id or "").strip().lower()
+        if not needle:
+            return False
+        restricted = self._restricted_voices()
+        if needle in restricted:
+            return True
+        resolved = self._resolve_voice_id(needle)
+        if resolved and resolved.strip().lower() in restricted:
+            return True
+        return False
+
+    def _can_use_restricted_voice(self, event: AstrMessageEvent) -> bool:
+        primary_users = self._primary_users()
+        if not primary_users:
+            return True
+        sender = str(getattr(event, "get_sender_id", lambda: "")() or "")
+        return sender in primary_users
+
     def _intimate_users(self) -> set[str]:
         """放行色色语义的用户。单独配了就用自己的，留空回落到主用户。"""
         raw = self._cfg("intimate_scene_ids", "") or ""
@@ -1086,6 +1131,10 @@ class TtsStudio(Star):
         if self._matches_skip_pattern(text):
             return False, "skip_pattern"
 
+        # 工作/技术长回复跳过：含有执行计划、代码块、或架构分析，不烧 TTS token
+        if any(marker in text for marker in ("<plan>", "</plan>", "```")):
+            return False, "work_or_code_response"
+
         scope = str(self._cfg("trigger_scope", "primary_private") or "")
         private = self._is_private(event)
         primary = self._primary_users()
@@ -1100,9 +1149,12 @@ class TtsStudio(Star):
 
         min_len = int(self._cfg("min_chars", 1) or 1)
         max_len = int(self._cfg("hard_max_chars", 800) or 800)
-        if len(text) < min_len:
+        # {} 里是第一人称演出描写（动作/神态/生理反应），只给眼睛看，
+        # 不参与语音合成，也不该占用字数配额
+        spoken = _BRACE_RE.sub("", text).strip()
+        if len(spoken) < min_len:
             return False, "too_short"
-        if len(text) > max_len:
+        if len(spoken) > max_len:
             return False, "too_long"
 
         if self._cfg("skip_when_contains_media", True) and self._has_media(event):
@@ -1142,6 +1194,40 @@ class TtsStudio(Star):
         return "".join(parts).strip()
 
     # -------------------------------------------------------------- 转写
+
+    def _mechanical_clean(self, text: str) -> str:
+        """不改语义的机械清洗：剥括号注释、剥 Markdown 符号、收拢空白。"""
+        out = re.sub(r"[（(][^）)]{0,60}[）)]", "", text)
+        out = re.sub(r"[\*_`#>]+", "", out)
+        out = re.sub(r"[ \t]+", " ", out).strip()
+        return out or text
+
+    def _fidelity_guard(self, src: str, dst: str, lang: str = "zh") -> str:
+        """改写保真守卫：长度比或用字覆盖率跑偏就丢掉改写稿，退回原文机械清洗。
+        仅对中文及其方言等同语种做用字覆盖率检查；跨语种翻译时放行。"""
+        try:
+            # 跨语种（日、韩、英、德、俄等非中文系）转译跳过汉字覆盖率比对，只做基础非空防御
+            is_chinese_variant = lang in ["zh", "yue", "dongbei", "sichuan", "cantonese"]
+            if not is_chinese_variant:
+                return dst
+
+            a = re.sub(r"\s+", "", src)
+            b = re.sub(r"\s+", "", dst)
+            if not a or not b:
+                return dst
+            ratio = len(b) / len(a)
+            limit = float(self._cfg("fidelity_ratio_limit", 0.18) or 0.18)
+            clean = lambda s: re.sub(r"[^0-9A-Za-z\u3040-\u30ff\u4e00-\u9fff]", "", s)
+            sa, sb = set(clean(src)), set(clean(dst))
+            cover = len(sa & sb) / max(1, len(sa))
+            if ratio < 1 - limit or ratio > 1 + limit or cover < 0.72:
+                logger.warning(
+                    "%s 转换偏离原文(长度比 %.2f 覆盖率 %.2f)，丢弃改写稿回退原文", LOG_TAG, ratio, cover
+                )
+                return self._mechanical_clean(src)
+        except Exception as exc:
+            logger.warning("%s 保真守卫异常，按原样放行: %s", LOG_TAG, exc)
+        return dst
 
     async def _convert(self, text: str, event: AstrMessageEvent) -> str:
         provider = self._conversion_provider(event)
@@ -1188,6 +1274,7 @@ class TtsStudio(Star):
 
         spoken = str(getattr(response, "completion_text", "") or "").strip()
         spoken = spoken or text
+        spoken = self._fidelity_guard(text, spoken, lang=lang)
         return self._tag_emotion(spoken, event, session=session)
 
     def _tag_emotion(
@@ -1221,11 +1308,33 @@ class TtsStudio(Star):
             cursor = pos + len(seg)
             last_tag = tag
         if not inserts:
-            return spoken
+            return self._tag_emotion_by_order(spoken, pairs)
         out = spoken
         for pos, tag in sorted(inserts, key=lambda x: -x[0]):
             out = out[:pos] + tag + out[pos:]
         return out
+
+    _CLAUSE_SPLIT_RE = re.compile(r"(?<=[，。！？；：、,.!?;:…\n])")
+
+    def _tag_emotion_by_order(self, spoken: str, pairs: list[tuple[str, str]]) -> str:
+        """原文定位全落空时的兜底：按小句顺序把标签铺回去。
+
+        判定是在回复生成之前跑的，它写的小句原文跟真正的朗读稿对不上
+        是常态。这里不看原文，只拿标签序列按比例铺到朗读稿的小句上，
+        让情绪至少落在对的位置，而不是整条丢掉。
+        """
+        seq = [tag for _, tag in pairs]
+        if not any(seq):
+            return spoken
+        clauses = [c for c in self._CLAUSE_SPLIT_RE.split(spoken) if c.strip()]
+        if not clauses:
+            return next(t for t in seq if t) + spoken
+        n, m = len(clauses), len(seq)
+        assign: dict[int, str] = {}
+        for k, tag in enumerate(seq):
+            if tag:
+                assign[min(n - 1, (k * n) // m)] = tag
+        return "".join(assign.get(i, "") + c for i, c in enumerate(clauses))
 
     def _scene_hint(self, event: AstrMessageEvent) -> str:
         """当前场景标签，转写时喂给模型让它贴合情境。没有就返回空。"""
@@ -1532,7 +1641,7 @@ class TtsStudio(Star):
             return
         ok, reason = self._should_trigger(event, raw)
         if not ok:
-            logger.debug("%s 跳过合成: %s", LOG_TAG, reason)
+            logger.info("%s 跳过合成: %s (文本: %r)", LOG_TAG, reason, raw[:40])
             return
 
         spoken = strip_for_speech(
@@ -1543,6 +1652,12 @@ class TtsStudio(Star):
         )
         if not spoken:
             logger.debug("%s 净化后无内容", LOG_TAG)
+            return
+
+        # 朗读稿字数过滤：工作报告或长文如果超过设定字数（默认 180 字）直接跳过，防止费钱
+        max_spoken = int(self._cfg("max_spoken_chars", 180) or 180)
+        if len(spoken) > max_spoken:
+            logger.info("%s 朗读内容过长（%d 字 > %d 字），跳过合成节省 token", LOG_TAG, len(spoken), max_spoken)
             return
 
         session = self._session_id(event)
@@ -1611,7 +1726,7 @@ class TtsStudio(Star):
                     MessageChain([Record(file=audio, url=audio, text=raw)]),
                 )
                 self._remember_voice(session, converted)
-                logger.info("%s 已追发语音: %s 字 → %s", LOG_TAG, len(converted), audio)
+                logger.info("%s 已追发语音[%s]: %s 字 → %s", LOG_TAG, session, len(converted), audio)
             except Exception as exc:
                 logger.warning("%s 后台语音失败: %s", LOG_TAG, exc)
 
